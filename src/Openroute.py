@@ -1,10 +1,11 @@
 import requests 
-import time
 
+from .Tools import validateCoordinate
 from .Models import Coordinate, OpenrouteMatrix, OpenrouteSummary, QuotaExhaustedError, RateLimiting
 
+# Makes sense that this DOES have disabling built into
+# the class since it has a daily quota
 class Openroute:
-    failLimit: RateLimiting
     singleLimit: RateLimiting
     matrixLimit: RateLimiting
     apiKey: str
@@ -13,15 +14,6 @@ class Openroute:
     MAX_RETRIES: int = 5
 
     def __init__(self, apiKey: str, disable: bool = False) -> None:
-        self.failLimit = RateLimiting(
-                    minDelay=1,
-                    delay=1,
-                    maxDelay=60,
-                    lastRequest=0,
-                    lastFail=0,
-                    nFail=0,
-                    base=2
-                )
         self.singleLimit = RateLimiting(
                     minDelay=(60/40),
                     delay=(60/40),
@@ -44,30 +36,23 @@ class Openroute:
         self.disableSingle = disable
         self.disableMatrix = disable
 
-    def validateCoordinate(self, coord: Coordinate):
-        return (
-            -90 <= coord.latitude <= 90 and
-            -180 <= coord.longitude <= 180
-        )
-
     # Handles choosing matrix route summary vs single route summary, 
     # In the future, it should be able to do batches of locations and their destinations. for now, it'll just do one location to destination
-    def getMultipleRouteSummaries(self, locations: list[Coordinate]) -> OpenrouteMatrix | None:
+    def getMultipleRouteSummaries(self, locations: list[Coordinate]) -> OpenrouteMatrix:
         if self.disableMatrix and self.disableSingle:
-            return None
+            return OpenrouteMatrix.invalidMatrix(len(locations))
 
-        for location in locations:
-            if not self.validateCoordinate(location):
-                raise ValueError("Invalid coordinates")
+        # Replace invalid locations with root location
+        for index, location in enumerate(locations):
+            if not validateCoordinate(location):
+                locations[index] = locations[0]
 
-        self.failLimit.reset()
         if not self.disableMatrix:
             for _ in range(self.MAX_RETRIES):
                 try:
                     locationsList = [[loc.longitude, loc.latitude] for loc in locations]
                     temp = self.getMatrixRouteSummary(locationsList)
-                    self.matrixLimit.lastRequest = time.time()
-                    self.matrixLimit.serialSuccessRate() # since succeeded, check if its been long enough
+                    self.matrixLimit.succeeded() # since succeeded, check if its been long enough
 
                     # Sanitize null results 
                     result = OpenrouteMatrix(
@@ -83,45 +68,39 @@ class Openroute:
                         match (http_err.response.status_code):
                             case 429:
                                 print("Rate limited")
-                                self.matrixLimit.lastFail = time.time()
-                                self.matrixLimit.exponentialBackoff()
+                                self.matrixLimit.failed()
                             case 403:
                                 remaining = int(http_err.response.headers.get("X-Ratelimit-Remaining", -1))
-                                self.singleLimit.lastFail = time.time()
-                                self.singleLimit.exponentialBackoff()
+                                self.matrixLimit.failed()
+                                self.disableMatrix = True
                                 if remaining == 0:
                                     print("Quota exhausted")
-                                    self.disableMatrix = True
                                 else:
                                     print(f"Other error: {http_err.response.reason}")
                                 break
                             case _:
                                 print(f"Other error: {http_err.response.reason}")
-                                self.matrixLimit.lastFail = time.time()
-                                self.matrixLimit.exponentialBackoff()
+                                self.matrixLimit.failed()
                 except requests.exceptions.ConnectionError:
                     print("Network error: Failed to connect to the server.")
-                    self.failLimit.lastFail = time.time()
-                    self.failLimit.exponentialBackoff()
+                    self.matrixLimit.failed()
                 except requests.exceptions.Timeout:
                     print("Timeout error: The request took too long.")
-                    self.failLimit.lastFail = time.time()
-                    self.failLimit.exponentialBackoff()
+                    self.matrixLimit.failed()
                 except ValueError as e:
-                    print(e)
-                    raise ValueError from e
+                    raise ValueError("Openroute Value Error: ") from e
                 except QuotaExhaustedError as e:
                     print(e)
+                    self.disableMatrix = True
                     break
                 except requests.exceptions.RequestException as err:
                     print(f"A generic requests error occurred: {err}")
-                    self.failLimit.lastFail = time.time()
-                    self.failLimit.exponentialBackoff()
-                self.failLimit.waitIfTooFast()
-        
-        self.failLimit.reset()
+                    self.matrixLimit.failed()
+                    raise requests.exceptions.RequestException from err
 
         if not self.disableSingle:
+            notFound = 0
+            found = 0
             temp = OpenrouteMatrix(
                 distanceMatrix=[[-1.0 for _ in range(len(locations))] for _ in range(len(locations))],
                 durationMatrix=[[-1.0 for _ in range(len(locations))] for _ in range(len(locations))]
@@ -134,16 +113,31 @@ class Openroute:
                         # Skip routes that have been successfully found
                         if temp.distanceMatrix[0][index] != -1:
                             continue
-                        summary = self.getRouteSummary(
-                                startLat=startLoc.latitude,
-                                startLon=startLoc.longitude,
-                                endLat=dest.latitude,
-                                endLon=dest.longitude
-                            )
-                        self.singleLimit.lastRequest = time.time()
-                        temp.distanceMatrix[0][index] = summary.distance
-                        temp.durationMatrix[0][index] = summary.duration
-                        self.singleLimit.serialSuccessRate()
+                        try:
+                            summary = self.getRouteSummary(
+                                    startLat=startLoc.latitude,
+                                    startLon=startLoc.longitude,
+                                    endLat=dest.latitude,
+                                    endLon=dest.longitude
+                                )
+                            found += 1
+                            self.singleLimit.succeeded()
+                            temp.distanceMatrix[0][index] = summary.distance
+                            temp.durationMatrix[0][index] = summary.duration
+                        except requests.exceptions.HTTPError as http_err:
+                            if http_err.response is not None:
+                                match (http_err.response.status_code):
+                                    case 404:
+                                        body = http_err.response.json()
+                                        errorCode = body.get("error", {}).get("code")
+                                        if errorCode == 2009 or errorCode == 2010:
+                                            print("No route found between two points, skipping")
+                                            notFound += 1
+                                            continue
+                                        else:
+                                            print(f"Server error: {body.get("error", {}).get("message")}")
+                                            self.singleLimit.failed()
+                            raise
 
                     result = temp
                     return result
@@ -154,45 +148,43 @@ class Openroute:
                         match (http_err.response.status_code):
                             case 429:
                                 print("Rate limited")
-                                self.singleLimit.lastFail = time.time()
-                                self.singleLimit.exponentialBackoff()
+                                self.singleLimit.failed()
                             case 403:
                                 remaining = int(http_err.response.headers.get("X-Ratelimit-Remaining", -1))
-                                self.singleLimit.lastFail = time.time()
-                                self.singleLimit.exponentialBackoff()
+                                self.singleLimit.failed()
+                                self.disableSingle = True
                                 if remaining == 0:
                                     print("Quota exhausted")
-                                    self.disableSingle = True
                                 else:
-                                    print(f"Other error: {http_err.response.reason}")
+                                    print(f"Other error: {http_err.response.reason} {http_err.response.json().get("error")}")
                                 break
                             case _:
-                                print(f"Other error: {http_err.response.reason}")
-                                self.singleLimit.lastFail = time.time()
-                                self.singleLimit.exponentialBackoff()
+                                print(f"Other error: {http_err.response.reason} {http_err.response.status_code} {http_err.response.json().get("error")}")
+                                self.singleLimit.failed()
                 except requests.exceptions.ConnectionError:
                     print("Network error: Failed to connect to the server.")
-                    self.failLimit.lastFail = time.time()
-                    self.failLimit.exponentialBackoff()
+                    self.singleLimit.failed()
                 except requests.exceptions.Timeout:
                     print("Timeout error: The request took too long.")
-                    self.failLimit.lastFail = time.time()
-                    self.failLimit.exponentialBackoff()
+                    self.singleLimit.failed()
                 except ValueError as e:
                     print(e)
                     raise ValueError from e
                 except QuotaExhaustedError as e:
                     print(e)
+                    self.disableSingle = True
                     break
                 except requests.exceptions.RequestException as err:
                     print(f"A generic requests error occurred: {err}")
-                    self.failLimit.lastFail = time.time()
-                    self.failLimit.exponentialBackoff()
+                    self.singleLimit.failed()
+                    raise requests.exceptions.RequestException from err
+            if (notFound + found) == len(locations):
+                print("Apartment could not find any POI routes")
+                return OpenrouteMatrix.invalidMatrix(len(locations))
 
-                # If the request fails, wait before making another one
-                self.failLimit.waitIfTooFast()
 
-        return None
+        # If i reach this point, I probably can't even call openroute api and need to break and cache the results
+        raise QuotaExhaustedError("OpenRoute API has been disabled")
 
     def getMatrixRouteSummary(self, locations: list[list[float]]) -> OpenrouteMatrix:
         if self.disableMatrix:
@@ -216,6 +208,8 @@ class Openroute:
             timeout=60
         )
 
+        self.matrixLimit.justCalled()
+
         response.raise_for_status()
         data = response.json()
         try:
@@ -234,6 +228,7 @@ class Openroute:
         
         url = f"https://api.heigit.org/openrouteservice/v2/directions/driving-car?api_key={self.apiKey}&start={startLon},{startLat}&end={endLon},{endLat}"
         response = requests.get(url, timeout=60)
+        self.singleLimit.justCalled()
         response.raise_for_status()
         data = response.json()
         try:

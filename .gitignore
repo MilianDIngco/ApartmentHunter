@@ -1,4 +1,6 @@
 # output files
+logs/
+cache/
 *searchParams.json
 *RentcastCache.json
 *.xlsx

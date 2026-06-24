@@ -1,14 +1,13 @@
 import os
 import json
 import argparse
+import requests
 from dotenv import load_dotenv, find_dotenv
-import usaddress
-import re
 import pandas as pd
+from pathlib import Path
 from dataclasses import asdict
-from src.Models import Coordinate, ListingExcel, OpenrouteMatrix
+from src.Models import Coordinate, ListingExcel, QuotaExhaustedError
 from src.Models import OpenrouteSummary
-from src.Models import POI
 from src.RentCast import RentCast
 from src.Openroute import Openroute
 from src.Geocoding import Geocoding
@@ -26,32 +25,18 @@ disableOpenroute = False
 rentcastCacheOnly = True
 rentcastLimit = 450
 
-args = None
+# ADD CATEGORIES FROM https://apidocs.geoapify.com/docs/places/#categories
+# but be aware, for each category, it requires another API request to OpenRoute
+# which has a daily quota. 
+poiCategories = [
+    "leisure.park",
+    "commercial.supermarket",
+    "education.library"
+]
+poiNames = [name.split('.')[-1] for name in poiCategories]
 
 def main():
-    # Grab command line arguments
-    parser = argparse.ArgumentParser(description="A commandline tool to help you find apartments and their distances to points of interest")
-
-    parser.add_argument("-t", "--useTemp", help="Uses the JSON file filled with example listings from RentCast instead of calling the API. Takes a filename to the JSON file. File should live in the lib/ directory, and filename should end in .json", type=str)
-    parser.add_argument("-O", "--disableOpenroute", action="store_true", help="Disables the openroute request API")
-    parser.add_argument("-c", "--rentcastCacheOnly", action="store_true", help="If a cache filename is provided and valid, only use the cached listings and do not call the RentCast API.")
-    parser.add_argument("-C", "--rentcastCacheFilename", type=str, help="Sets the filename to the cached listing .json file, that the program will use instead of or in addition to the listings provided by the rentcast API")
-    parser.add_argument("-S", "--searchParameterFilename", type=str, help=f"""Sets the filename to the search parameter json file. This file should follow the following form: 
-    {searchParamExample}
-""")
-    parser.add_argument("-L", "--rentcastRequestLimit", default=0, type=int, help="Since Rentcast has the lowest monthly limit, this option is available to set the number of maximum allowed requests. If you are above the quota, and want to pay, setting this above zero will allow you to do that, but it is 20 cents per request since you are on the free plan")
-    args = parser.parse_args()
-
-    print(f"useTemp: {args.useTemp}")
-    print(f"disableOpenroute: {args.disableOpenroute}")
-    print(f"rentcastCacheOnly: {args.rentcastCacheOnly}")
-    print(f"rentcastCacheFilename: {args.rentcastCacheFilename}")
-    print(f"searchParameterFilename: {args.searchParameterFilename}")
-    print(f"rentcastRequestLimit: {args.rentcastRequestLimit}")
-
-    # TODO im sure theres better ways to handle arg priority but... buh.. buss
-    if args.rentcastCacheOnly:
-        args.rentcastRequestLimit = 0
+    args = setCommandLineArguments()
 
     # Get centering and work address, and searchRadius
     searchParams = None
@@ -82,12 +67,24 @@ def main():
                     else:
                         searchParams["centerAddress"] = centerAddress
                         searchParams["workAddress"] = workAddress
+
         except FileNotFoundError:
             print(f"ERROR: {args.searchParameterFilename} not found")
             
     # Ask for user input to get search parameters
     if searchParams is None:
-        searchParams = grabSearchParamInput()
+        searchParams, searchParamsFilename = grabAndSaveSearchParamInput()
+    else:
+        # if didn't have to, it means it got the search params from args
+        searchParamsFilename = args.searchParameterFilename
+
+    # Ask for excel filename output if not provided
+    outputExcelFilename = args.outputExcelFilename if args.outputExcelFilename else ""
+    if args.outputExcelFilename and validXLSXFilename(filename=args.outputExcelFilename):
+        outputExcelFilename = args.outputExcelFilename
+    else:
+        while not validXLSXFilename(outputExcelFilename := input("Enter the filename you would like to save the data into (include the file extension .xlsx): ")):
+            print("Enter a valid filename")
 
     # Grab API keys
     load_dotenv(find_dotenv())
@@ -106,25 +103,21 @@ def main():
     # Grab coordinates for center and work
     geocoding = Geocoding(apiKey=geocoding_APIKEY)
 
-    while (centerCoord := geocoding.addressToCoord(
+    centerCoord = geocoding.addressToCoord(
             street=searchParams["centerAddress"].street, 
             city=searchParams["centerAddress"].city, 
             state=searchParams["centerAddress"].state, 
             postalCode=searchParams["centerAddress"].postal, 
             country="US")
-           ).latitude < -1000:
-        print(f"Trying to grab center coordinate again, attempts left: {-centerCoord.latitude}")
 
     print(f"Center coordinate: lat={centerCoord.latitude}, lon={centerCoord.longitude}")
 
-    while (workCoord := geocoding.addressToCoord(
+    workCoord = geocoding.addressToCoord(
             street=searchParams["workAddress"].street, 
             city=searchParams["workAddress"].city, 
             state=searchParams["workAddress"].state, 
             postalCode=searchParams["workAddress"].postal, 
             country="US")
-           ).latitude < -1000: 
-        print(f"Trying to grab work coordinate again, attempts left: {-workCoord.latitude}")
 
     print(f"Work coordinate: lat={workCoord.latitude}, lon={workCoord.longitude}")
 
@@ -136,15 +129,40 @@ def main():
                         requestLimit=args.rentcastRequestLimit)
 
     print(f"Starting search on [{searchParams["centerAddress"]}], with a search radius of {searchParams["searchRadiusMiles"]} miles, and commute address at [{searchParams["workAddress"]}]")
+    print(f"Will be able to run {500 + 2000 / len(poiCategories)} requests today, assuming OpenRoute quota has fully reset")
 
-    if os.path.isfile(f"lib/{args.useTemp}"): 
+    if not os.path.exists("cache/"):
+        Path("cache/").mkdir(parents=True, exist_ok=True)
+
+    if args.useTemp and os.path.isfile(f"lib/{args.useTemp}"): 
         rentcast.setTempAsListings(args.useTemp)
-    elif os.path.isfile(args.rentcastCacheFilename): 
+    elif args.rentcastCacheFilename and os.path.isfile(f"cache/{args.rentcastCacheFilename}"): 
         rentcast.loadCache(args.rentcastCacheFilename)
 
     if (not args.rentcastCacheOnly) and (args.useTemp is None): 
-        rentcast.requestAllListings()
+        try: 
+            rentcast.requestAllListings()
+            # Cache listings if new listings were grabbed
+            rentcast.cacheListings(cacheFilename=args.rentcastCacheFilename)
+        except ValueError as err:
+            print(f"ERROR: ")
+        except requests.exceptions.RequestException as err:
+            print(f"ERROR: ")
+        except QuotaExhaustedError as err:
+            print(f"ERROR: ")
+
+    # Check validity of listings, if invalid, quit program
+    if len(rentcast.listings) == 0:
+        print("ERROR: No listings found. Check if RentCast is available")
+        exit(0)
     
+    # Grab processed cache
+    processedCache = None
+    processedCachePath = os.path.join("cache/", args.processedCacheFilename)
+    if args.processedCacheFilename and args.rentcastCacheFilename and os.path.exists(processedCachePath):
+        with open(processedCachePath, "r") as f:
+            processedCache = json.load(f)
+
     # Initialize API classes
     openroute = Openroute(apiKey=openroute_APIKEY, disable=args.disableOpenroute)
     geoapify = Geoapify(apiKey=geoapify_APIKEY)
@@ -154,7 +172,10 @@ def main():
     nListings = len(rentcast.listings)
     nCompleted = 0
 
-    for listing in rentcast.listings:
+
+    for index, listing in enumerate(rentcast.listings):
+        print(f"Completion: {100 * len(listingsDict) / nListings}%")
+        print(f"{len(listingsDict)} / {nListings}")
         # ================================SIMPLE INCLUDED DATA=================================
         print("Getting listing info: ")
         listingLat = listing.get("latitude", "-1")
@@ -173,84 +194,153 @@ def main():
         print(f"Bedrooms: {listingBedrooms}")
         listingBathrooms = listing.get("bathrooms", "-1")
         print(f"Bathrooms: {listingBathrooms}")
-        # ===============================OPENROUTE SERVICE===================================
+        
+        # ===============================Check for duplicates===================================
+
+        if processedCache and index < len(processedCache):
+            processedListing = processedCache[index]
+            
+            if (processedListing["address"] == listingAddr and
+                processedListing["location"] == f"{listingCoord.latitude}, {listingCoord.longitude}" and
+                processedListing["bedrooms"] == listingBedrooms and
+                processedListing["bathrooms"] == listingBathrooms):
+                listingsDict.append(processedListing)
+                continue
+            
+        # ===============================GEOAPIFY POI SERVICE===================================
         pois = geoapify.findPOIs(
-            latitude=listingLat, 
-            longitude=listingLon, 
-            radiusMiles=searchParams["searchRadiusMiles"]
+            latitude=listingCoord.latitude, 
+            longitude=listingCoord.longitude, 
+            radiusMiles=searchParams["searchRadiusMiles"],
+            poiCategories=poiCategories
         )
-        supermarket = pois.get("Supermarket")
-        library = pois.get("Library")
-        park = pois.get("Park")
         locations = [
             listingCoord,
-            workCoord,
-            supermarket if supermarket is not None else listingCoord,
-            library if library is not None else listingCoord,
-            park if park is not None else listingCoord
+            workCoord
         ]
+        for name in poiNames:
+            coord = pois.get(name)
+            locations.append(coord if coord else listingCoord) # Use listing coord if no POI found -> res = 0
 
-        summary = openroute.getMatrixRouteSummary(locations)
+        # ===============================OPENROUTE SERVICE===================================
+        try:
+            print("Finding Routes")
+            summary = openroute.getMultipleRouteSummaries(locations)
+            workSummary = OpenrouteSummary(
+                        duration=summary.durationMatrix[0][1],
+                        distance=summary.distanceMatrix[0][1]
+                    )
+            print(f"Work commute: {workSummary}")
+            poiSummaries = {}
+            for index, name in enumerate(poiNames):
+                poiSummaries[name] = OpenrouteSummary(
+                            duration=summary.durationMatrix[0][index + 2],
+                            distance=summary.distanceMatrix[0][index + 2]
+                        )
+                print(f"{name} commute: {poiSummaries[name]}")
+            
+            info = ListingExcel(
+                        address=listingAddr,
+                        location=f"{listingCoord.latitude}, {listingCoord.longitude}",
+                        listedPrice=listingPrice,
+                        bedrooms=listingBedrooms,
+                        bathrooms=listingBathrooms,
+                        workCommuteDuration=workSummary.duration / 60,
+                        workCommuteDistance=workSummary.distance / 1609
+                    )
 
-        if summary is None or summary.distanceMatrix is None or summary.durationMatrix is None:
-            print(f"ERROR: Failed to get matrix summary for {listingAddr}")
-            summary = OpenrouteMatrix(
-                distanceMatrix=[[-1 for _ in range(6)] for _ in range(6)],
-                durationMatrix=[[-1 for _ in range(6)] for _ in range(6)]
-            )
+            # Convert to dictionary and add summaries dynamically
+            infoDict = asdict(info)
+            for key, value in poiSummaries.items():
+                infoDict[f"{key}CommuteDuration"]=value.duration / 60
+                infoDict[f"{key}CommuteDistance"]=value.distance
 
-        listingWork = OpenrouteSummary(
-                    duration=summary.durationMatrix[0][1],
-                    distance=summary.distanceMatrix[0][1]
-                )
-        listingSupermarket = OpenrouteSummary(
-                    duration=summary.durationMatrix[0][2],
-                    distance=summary.distanceMatrix[0][2]
-                )
-        listingLibrary = OpenrouteSummary(
-                    duration=summary.durationMatrix[0][3],
-                    distance=summary.distanceMatrix[0][3]
-                )
-        listingPark = OpenrouteSummary(
-                    duration=summary.durationMatrix[0][4],
-                    distance=summary.distanceMatrix[0][4]
-                )
-        print(f"Work commute: {listingWork}")
-        print(f"Supermarket commute: {listingSupermarket}")
-        print(f"Library commute: {listingLibrary}")
-        print(f"Park commute: {listingPark}")
-        
-        info = ListingExcel(
-                    address=listingAddr,
-                    location=f"{listingCoord.latitude}, {listingCoord.longitude}",
-                    listedPrice=listingPrice,
-                    workCommuteDuration=listingWork.duration / 60,
-                    workCommuteDistance=listingWork.distance / 1609,
-                    supermarketCommuteDuration=listingSupermarket.duration / 60,
-                    supermarketCommuteDistance=listingSupermarket.distance / 1609,
-                    libraryCommuteDuration=listingLibrary.duration / 60,
-                    libraryCommuteDistance=listingLibrary.distance / 1609,
-                    parkCommuteDuration=listingPark.duration / 60,
-                    parkCommuteDistance=listingPark.distance / 1609,
-                    bedrooms=listingBedrooms,
-                    bathrooms=listingBathrooms
-                )
+            listingsDict.append(infoDict)
 
-        listingsDict.append(asdict(info))
+            nCompleted += 1
+        except ValueError as err:
+            print(f"ERROR: Unexpected value format from route summary: {err.args}")
+            if nCompleted > 0:
+                cacheProcessedAndExit(processed=listingsDict, 
+                                      processedCacheFilename=args.processedCacheFilename,
+                                      rentcastCacheFilename=args.rentcastCacheFilename,
+                                      searchParamsFilename=searchParamsFilename,
+                                      outputExcelFilename=outputExcelFilename,
+                                      completedRentcast=rentcast.completed
+                                      )
+            else:
+                exit(1)
+        except requests.exceptions.RequestException as err:
+            print(f"ERROR: Unhandled error from route summary {err}")
+            if nCompleted > 0:
+                cacheProcessedAndExit(processed=listingsDict, 
+                                      processedCacheFilename=args.processedCacheFilename,
+                                      rentcastCacheFilename=args.rentcastCacheFilename,
+                                      searchParamsFilename=searchParamsFilename,
+                                      outputExcelFilename=outputExcelFilename,
+                                      completedRentcast=rentcast.completed
+                                      )
+            else:
+                exit(1)
+        except QuotaExhaustedError as err:
+            print(f"ERROR: Quota {err}")
+            if nCompleted > 0:
+                cacheProcessedAndExit(processed=listingsDict, 
+                                      processedCacheFilename=args.processedCacheFilename,
+                                      rentcastCacheFilename=args.rentcastCacheFilename,
+                                      searchParamsFilename=searchParamsFilename,
+                                      outputExcelFilename=outputExcelFilename,
+                                      completedRentcast=rentcast.completed
+                                      )
+            else:
+                exit(1)
 
-        nCompleted += 1
-        print(f"Completion: {100 * nCompleted / nListings}%")
 
     # Save as excel spreadsheet
     df = pd.DataFrame(listingsDict)
-    df.columns=["Address", "Coord", "Price", "Work Dist(mi)", "Work Dur(min)", "Supermarket Dist(mi)", "Supermarket Dur(min)", "Library Dist(mi)", "Library Dur(min)", "Park Dist(mi)", "Park Dur(min)", "bedrooms", "bathrooms"]
+    columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
+    for name in poiNames:
+        durationColumn = f"{name.title()} Dur(min)"
+        distanceColumn = f"{name.title()} Dist(mi)"
+        columns.append(durationColumn)
+        columns.append(distanceColumn)
 
-    while not validXLSXFilename(filename := input("Enter the filename you would like to save the data into (include the file extension .xlsx): ")):
-        print("Enter a valid filename")
+    df.columns=columns
 
-    df.to_excel(filename, index=False, float_format="%.2f")
+    df.to_excel(outputExcelFilename, index=False, float_format="%.2f")
+    print(f"Outputting to {outputExcelFilename}")
 
-def grabSearchParamInput() -> dict:
+def setCommandLineArguments():
+    # Grab command line arguments
+    parser = argparse.ArgumentParser(description="A commandline tool to help you find apartments and their distances to points of interest")
+
+    parser.add_argument("-t", "--useTemp", help="Uses the JSON file filled with example listings from RentCast instead of calling the API. Takes a filename to the JSON file. File should live in the lib/ directory, and filename should end in .json", type=str)
+    parser.add_argument("-O", "--disableOpenroute", action="store_true", help="Disables the openroute request API")
+    parser.add_argument("-c", "--rentcastCacheOnly", action="store_true", help="If a cache filename is provided and valid, only use the cached listings and do not call the RentCast API.")
+    parser.add_argument("-C", "--rentcastCacheFilename", type=str, help="Sets the filename to the cached listing .json file, that the program will use instead of or in addition to the listings provided by the rentcast API")
+    parser.add_argument("-S", "--searchParameterFilename", type=str, help=f"""Sets the filename to the search parameter json file. This file should follow the following form: 
+    {searchParamExample}
+""")
+    parser.add_argument("-P", "--processedCacheFilename", default="processed.json", type=str, help="Sets the filename to the cached processed listing .json file. These will hold the listings that have been processed, and when running again, will use to skip")
+    parser.add_argument("-E", "--outputExcelFilename", type=str, help="Sets the filename the output excel file will be written to")
+    parser.add_argument("-L", "--rentcastRequestLimit", default=0, type=int, help="Since Rentcast has the lowest monthly limit, this option is available to set the number of maximum allowed requests. If you are above the quota, and want to pay, setting this above zero will allow you to do that, but it is 20 cents per request since you are on the free plan")
+    args = parser.parse_args()
+
+    print(f"useTemp: {args.useTemp}")
+    print(f"disableOpenroute: {args.disableOpenroute}")
+    print(f"rentcastCacheOnly: {args.rentcastCacheOnly}")
+    print(f"rentcastCacheFilename: {args.rentcastCacheFilename}")
+    print(f"searchParameterFilename: {args.searchParameterFilename}")
+    print(f"processedCacheFilename: {args.processedCacheFilename}")
+    print(f"rentcastRequestLimit: {args.rentcastRequestLimit}")
+
+    # TODO im sure theres better ways to handle arg priority but... buh.. buss
+    if args.rentcastCacheOnly or args.useTemp:
+        args.rentcastRequestLimit = 0
+
+    return args
+
+def grabAndSaveSearchParamInput() -> tuple[dict, str]:
     searchParams = searchParamExample.copy()
 
     while True:
@@ -301,8 +391,36 @@ def grabSearchParamInput() -> dict:
             searchParams["workAddress"] = parsedWorkAddress
             break
 
-    return searchParams
+    # Save search params into search param file
+    searchParamsSave = searchParamExample.copy()
+    searchParamsSave["centerAddress"] = centerAddress
+    searchParamsSave["workAddress"] = workAddress
+    searchParamsSave["searchRadiusMiles"] = searchRadius
+    searchParamsFilename = f"searchParams{searchParamsSave["centerAddress"]}{searchParamsSave["searchRadiusMiles"]}.json"
+    with open(searchParamsFilename, "w") as f:
+        json.dump(searchParamsSave, f, indent=4)
 
+    print(f"Saved searchParams to {searchParamsFilename}")
+
+    return (searchParams, searchParamsFilename)
+
+def cacheProcessedAndExit(processed: list[dict], processedCacheFilename: str, rentcastCacheFilename: str, searchParamsFilename: str, outputExcelFilename: str, completedRentcast: bool):
+    if len(processed) == 0:
+        print("No processed listings to cache")
+        exit(1)
+
+    path = os.path.join("cache/", processedCacheFilename)
+    with open(path, "w") as f:
+        json.dump(processed, f, indent=4)
+    print(f"Saved cache files to {path}")
+
+    print(f"""
+    Once the quota has reset, run 
+        `python3 main.py {"-c " if completedRentcast else ""}-C {rentcastCacheFilename} -S {searchParamsFilename} -P {processedCacheFilename}{" -E " if outputExcelFilename != "" else ""}{outputExcelFilename} [-L <rentcastLimit>]`
+    Set rentcastLimit if you're broke and the quota hasn't reset and can't pay for the reqs
+    """)
+
+    exit(1)
 
 if __name__ == "__main__":
     main()

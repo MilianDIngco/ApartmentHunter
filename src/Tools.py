@@ -1,7 +1,13 @@
 from pathlib import Path 
 import re
 import usaddress
-from .Models import Address
+from .Models import Address, Coordinate
+
+def validateCoordinate(coord: Coordinate):
+    return (
+        -90 <= coord.latitude <= 90 and
+        -180 <= coord.longitude <= 180
+    )
 
 def parseAddressString(address: str) -> Address | None:
     try:

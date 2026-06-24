@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import time
 
+# TBH i'm kiiinda just using this to indicate the API is 
+# unavailable... 
 class QuotaExhaustedError(Exception):
     def __init__(self, *args: object) -> None:
         super().__init__(*args)
@@ -13,6 +15,13 @@ class OpenrouteSummary:
 class OpenrouteMatrix:
     distanceMatrix: list[list[float]]
     durationMatrix: list[list[float]]
+
+    @staticmethod
+    def invalidMatrix(size: int):
+        return OpenrouteMatrix(
+                distanceMatrix=[[-1 for _ in range(size)] for _ in range(size)],
+                durationMatrix=[[-1 for _ in range(size)] for _ in range(size)]
+            )
 
 @dataclass
 class RateLimiting:
@@ -48,6 +57,18 @@ class RateLimiting:
             time.sleep(remaining)
         except ValueError:
             print("WARNING: No need to wait, time elapsed > set delay")
+
+    def justCalled(self):
+        self.lastRequest = time.time()
+
+    def succeeded(self):
+        self.nFail = 0
+        self.serialSuccessRate()
+
+    def failed(self):
+        self.lastFail = time.time()
+        self.nFail += 1
+        self.exponentialBackoff()
 
     # Decreases delay additively when success is sustained
     def serialSuccessRate(self):
@@ -94,13 +115,7 @@ class ListingExcel:
     address: str
     location: str
     listedPrice: str
-    workCommuteDuration: float | str
-    workCommuteDistance: float | str
-    supermarketCommuteDuration: float  | str
-    supermarketCommuteDistance: float | str
-    libraryCommuteDuration: float | str
-    libraryCommuteDistance: float | str
-    parkCommuteDuration: float | str
-    parkCommuteDistance: float | str
     bedrooms: int
     bathrooms: int
+    workCommuteDuration: float | str
+    workCommuteDistance: float | str

@@ -9,6 +9,7 @@ from pathlib import Path
 from dataclasses import asdict
 from src.Models import Coordinate, ListingExcel, QuotaExhaustedError
 from src.Models import OpenrouteSummary
+from src.Models import PropertyType
 from src.RentCast import RentCast
 from src.Openroute import Openroute
 from src.Geocoding import Geocoding
@@ -19,6 +20,21 @@ searchParamExample = {
     "centerAddress": None,
     "workAddress": None,
     "searchRadiusMiles": 0
+}
+
+optionalSearchParams = {
+    "priceMinimum": 0,
+    "priceMaximum": 0,
+    "propertyTypes": None
+}
+
+propertyTypeNames = {
+    "singlefamily" : PropertyType.SingleFamily,
+    "condo" : PropertyType.Condo,
+    "townhouse" : PropertyType.Townhouse,
+    "manufactured": PropertyType.Manufactured,
+    "multifamily": PropertyType.MultiFamily,
+    "apartment": PropertyType.Apartment
 }
 
 useTemp = False
@@ -45,7 +61,7 @@ def main():
             with open(args.searchParameterFilename, "r") as f:
                 searchParams = json.load(f)
 
-                # Checking form
+                # Checking form for bare minimum keys
                 if not searchParamExample.keys() <= searchParams.keys():
                     missing = searchParamExample.keys() - searchParams.keys()
                     print(f"ERROR: missing fields in search params: {missing}")
@@ -67,6 +83,30 @@ def main():
                     else:
                         searchParams["centerAddress"] = centerAddress
                         searchParams["workAddress"] = workAddress
+                    
+                        # Check for optional keys
+                        listingTypes = []
+                        if "propertyTypes" in searchParams.keys():
+                            listingTypes = [propertyTypeNames[lt] for lt in searchParams["listingType"] if lt in propertyTypeNames.keys()]
+                        searchParams["propertyTypes"] = listingTypes
+
+                        if "priceMinimum" in searchParams.keys():
+                            priceMinimum = searchParams["priceMinimum"]
+                            if isNum(priceMinimum) and priceMinimum > 0:
+                                searchParams["priceMinimum"] = priceMinimum
+                            else:
+                                searchParams["priceMinimum"] = -1
+                        else:
+                            searchParams["priceMinimum"] = -1
+
+                        if "priceMaximum" in searchParams.keys():
+                            priceMaximum = searchParams["priceMaximum"]
+                            if isNum(priceMaximum) and priceMaximum > searchParams["priceMinimum"]:
+                                searchParams["priceMaximum"] = priceMaximum
+                            else:
+                                searchParams["priceMaximum"] = -1
+                        else:
+                            searchParams["priceMaximum"] = -1
 
         except FileNotFoundError:
             print(f"ERROR: {args.searchParameterFilename} not found")
@@ -126,8 +166,12 @@ def main():
                         latitude=centerCoord.latitude,
                         longitude=centerCoord.longitude,
                         radiusMiles=searchParams["searchRadiusMiles"],
-                        requestLimit=args.rentcastRequestLimit)
-
+                        requestLimit=args.rentcastRequestLimit,
+                        priceMin=searchParams["priceMinimum"],
+                        priceMax=searchParams["priceMaximum"],
+                        propertyTypes=searchParams["propertyTypes"]
+                        )
+    
     print(f"Starting search on [{searchParams["centerAddress"]}], with a search radius of {searchParams["searchRadiusMiles"]} miles, and commute address at [{searchParams["workAddress"]}]")
     print(f"Will be able to run {500 + 2000 / len(poiCategories)} requests today, assuming OpenRoute quota has fully reset")
 
@@ -155,6 +199,8 @@ def main():
     if len(rentcast.listings) == 0:
         print("ERROR: No listings found. Check if RentCast is available")
         exit(0)
+
+    rentcast.removeUnwantedListings()
     
     # Grab processed cache
     processedCache = None
@@ -171,7 +217,6 @@ def main():
     listingsDict = []
     nListings = len(rentcast.listings)
     nCompleted = 0
-
 
     for index, listing in enumerate(rentcast.listings):
         print(f"Completion: {100 * len(listingsDict) / nListings}%")
@@ -253,7 +298,7 @@ def main():
             infoDict = asdict(info)
             for key, value in poiSummaries.items():
                 infoDict[f"{key}CommuteDuration"]=value.duration / 60
-                infoDict[f"{key}CommuteDistance"]=value.distance
+                infoDict[f"{key}CommuteDistance"]=value.distance / 1609
 
             listingsDict.append(infoDict)
 
@@ -262,12 +307,13 @@ def main():
             print(f"ERROR: Unexpected value format from route summary: {err.args}")
             if nCompleted > 0:
                 cacheProcessed(processed=listingsDict, 
-                               processedCacheFilename=args.processedCacheFilename,
-                               rentcastCacheFilename=args.rentcastCacheFilename,
-                               searchParamsFilename=searchParamsFilename,
-                               outputExcelFilename=outputExcelFilename,
-                               completedRentcast=rentcast.completed
+                               processedCacheFilename=args.processedCacheFilename
                                )
+                print(f"""
+                Once the quota has reset, run 
+                    `python3 main.py {"-c " if rentcast.completed else ""}-C {args.rentcastCacheFilename} -S {searchParamsFilename} -P {args.processedCacheFilename}{" -E " if outputExcelFilename != "" else ""}{outputExcelFilename} [-L <rentcastLimit>]`
+                Set rentcastLimit if you're broke and the quota hasn't reset and can't pay for the reqs
+                """)
                 columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
                 generatePOIColumnNames(columns, poiCategories)
                 saveExcel(listingsDict, columns, outputExcelFilename)
@@ -276,12 +322,13 @@ def main():
             print(f"ERROR: Unhandled error from route summary {err}")
             if nCompleted > 0:
                 cacheProcessed(processed=listingsDict, 
-                               processedCacheFilename=args.processedCacheFilename,
-                               rentcastCacheFilename=args.rentcastCacheFilename,
-                               searchParamsFilename=searchParamsFilename,
-                               outputExcelFilename=outputExcelFilename,
-                               completedRentcast=rentcast.completed
+                               processedCacheFilename=args.processedCacheFilename
                                )
+                print(f"""
+                Once the quota has reset, run 
+                    `python3 main.py {"-c " if rentcast.completed else ""}-C {args.rentcastCacheFilename} -S {searchParamsFilename} -P {args.processedCacheFilename}{" -E " if outputExcelFilename != "" else ""}{outputExcelFilename} [-L <rentcastLimit>]`
+                Set rentcastLimit if you're broke and the quota hasn't reset and can't pay for the reqs
+                """)
                 columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
                 generatePOIColumnNames(columns, poiCategories)
                 saveExcel(listingsDict, columns, outputExcelFilename)
@@ -290,12 +337,13 @@ def main():
             print(f"ERROR: Quota {err}")
             if nCompleted > 0:
                 cacheProcessed(processed=listingsDict, 
-                               processedCacheFilename=args.processedCacheFilename,
-                               rentcastCacheFilename=args.rentcastCacheFilename,
-                               searchParamsFilename=searchParamsFilename,
-                               outputExcelFilename=outputExcelFilename,
-                               completedRentcast=rentcast.completed
+                               processedCacheFilename=args.processedCacheFilename
                                )
+                print(f"""
+                Once the quota has reset, run 
+                    `python3 main.py {"-c " if rentcast.completed else ""}-C {args.rentcastCacheFilename} -S {searchParamsFilename} -P {args.processedCacheFilename}{" -E " if outputExcelFilename != "" else ""}{outputExcelFilename} [-L <rentcastLimit>]`
+                Set rentcastLimit if you're broke and the quota hasn't reset and can't pay for the reqs
+                """)
                 columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
                 generatePOIColumnNames(columns, poiCategories)
                 saveExcel(listingsDict, columns, outputExcelFilename)
@@ -304,16 +352,13 @@ def main():
 
     # Cache in case it fails
     cacheProcessed(processed=listingsDict, 
-                   processedCacheFilename=args.processedCacheFilename,
-                   rentcastCacheFilename=args.rentcastCacheFilename,
-                   searchParamsFilename=searchParamsFilename,
-                   outputExcelFilename=outputExcelFilename,
-                   completedRentcast=rentcast.completed
+                   processedCacheFilename=args.processedCacheFilename
                    )
     # Save as excel spreadsheet
     columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
     generatePOIColumnNames(columns, poiCategories)
     saveExcel(listingsDict, columns, outputExcelFilename)
+    print(f"Successfully saved listings to {outputExcelFilename}")
 
 def setCommandLineArguments():
     # Grab command line arguments
@@ -395,12 +440,79 @@ def grabAndSaveSearchParamInput() -> tuple[dict, str]:
         else:
             searchParams["workAddress"] = parsedWorkAddress
             break
+#optionalSearchParams = {
+#    "priceMinimum": 0,
+#   "priceMaximum": 0,
+#   "propertyTypes": None
+#}
+
+    # Take priceMinimum
+    while True:
+        priceMinimum = -1
+        priceMinimumInput = input("Enter the minimum desired price (Press enter to set no minimum value): ")
+        if priceMinimumInput.strip() != "" and isNum(priceMinimumInput):
+            priceMinimum = float(priceMinimumInput)
+
+        if input(f"Is this correct? (Y/n): {priceMinimum if priceMinimum != -1 else "Use no minimum value"}")[0].lower() != 'y':
+            continue
+        else:
+            searchParams["priceMinimum"] = priceMinimum
+            break
+
+    while True:
+        priceMaximum = -1
+        priceMaximumInput = input("Enter the minimum desired price (Press enter to set no minimum value): ")
+        if priceMaximumInput.strip() != "" and isNum(priceMaximumInput):
+            priceMaximum = float(priceMinimumInput)
+
+        if input(f"Is this correct? (Y/n): {priceMaximum if priceMaximum != -1 else "Use no minimum value"}")[0].lower() != 'y':
+            continue
+        else:
+            searchParams["priceMaximum"] = priceMaximum
+            break
+
+    while True:
+        propertyTypeOptions = []
+        propertyTypeInput = input("""Enter the index/indices for the property type(s) you would like to search for:
+1: Single Family Listings
+2: Condo Listings
+3: Townhouse Listings
+4: Manufactured Listings
+5: Multifamily Listings
+6: Apartment Listings
+Or press enter to set no listing preferences
+Example: "126" would search for Single Family homes, Condos, and Apartments.  
+""")
+    
+        if propertyTypeInput.strip() != "":
+            if "1" in propertyTypeInput:
+                propertyTypeOptions.append("singlefamily")
+            if "2" in propertyTypeInput:
+                propertyTypeOptions.append("condo")
+            if "3" in propertyTypeInput:
+                propertyTypeOptions.append("townhouse")
+            if "4" in propertyTypeInput:
+                propertyTypeOptions.append("manufactured")
+            if "5" in propertyTypeInput:
+                propertyTypeOptions.append("multifamily")
+            if "6" in propertyTypeInput:
+                propertyTypeOptions.append("apartment")
+
+        if input(f"Is this correct? (Y/n): {propertyTypeOptions}")[0].lower() != 'y':
+            continue
+        else:
+            listingTypes = [propertyTypeNames[lt] for lt in propertyTypeOptions if lt in propertyTypeNames.keys()]
+            searchParams["propertyTypes"] = listingTypes
+            break
 
     # Save search params into search param file
     searchParamsSave = searchParamExample.copy()
     searchParamsSave["centerAddress"] = centerAddress
     searchParamsSave["workAddress"] = workAddress
     searchParamsSave["searchRadiusMiles"] = searchRadius
+    searchParamsSave["priceMinimum"] = priceMinimum
+    searchParamsSave["priceMaximum"] = priceMaximum
+    searchParamsSave["propertyTypes"] = propertyTypeOptions
     searchParamsFilename = f"searchParams{searchParamsSave["centerAddress"]}{searchParamsSave["searchRadiusMiles"]}.json"
     with open(searchParamsFilename, "w") as f:
         json.dump(searchParamsSave, f, indent=4)
@@ -425,7 +537,7 @@ def saveExcel(data: List[dict], colNames: List[str], filename):
 
     print(f"Outputting to {filename}")
 
-def cacheProcessed(processed: list[dict], processedCacheFilename: str, rentcastCacheFilename: str, searchParamsFilename: str, outputExcelFilename: str, completedRentcast: bool):
+def cacheProcessed(processed: list[dict], processedCacheFilename: str):
     if len(processed) == 0:
         print("No processed listings to cache")
         exit(1)
@@ -435,11 +547,6 @@ def cacheProcessed(processed: list[dict], processedCacheFilename: str, rentcastC
         json.dump(processed, f, indent=4)
     print(f"Saved cache files to {path}")
 
-    print(f"""
-    Once the quota has reset, run 
-        `python3 main.py {"-c " if completedRentcast else ""}-C {rentcastCacheFilename} -S {searchParamsFilename} -P {processedCacheFilename}{" -E " if outputExcelFilename != "" else ""}{outputExcelFilename} [-L <rentcastLimit>]`
-    Set rentcastLimit if you're broke and the quota hasn't reset and can't pay for the reqs
-    """)
 
 if __name__ == "__main__":
     main()

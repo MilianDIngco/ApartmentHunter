@@ -1,6 +1,15 @@
 from dataclasses import dataclass
+from enum import StrEnum, auto
 import time
 
+class PropertyType(StrEnum):
+        SingleFamily = "Single%Family"
+        Condo = "Condo"
+        Townhouse = "Townhouse"
+        Manufactured = "Manufactured"
+        MultiFamily = "Multi-Family"
+        Apartment = "Apartment"
+        
 # TBH i'm kiiinda just using this to indicate the API is 
 # unavailable... 
 class QuotaExhaustedError(Exception):

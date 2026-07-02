@@ -1,8 +1,10 @@
 import json
+from numpy import inf
 import requests
 import os
 from pathlib import Path
 from .Models import RateLimiting
+from .Models import PropertyType
 
 class RentCast:
     apiLimit: RateLimiting
@@ -14,8 +16,11 @@ class RentCast:
     radiusMiles: float
     listings: list
     completed: bool
+    priceMin: int
+    priceMax: int
+    propertyTypes: list[PropertyType]
 
-    def __init__(self, apiKey: str, latitude: float, longitude: float, radiusMiles: float, requestLimit: int) -> None:
+    def __init__(self, apiKey: str, latitude: float, longitude: float, radiusMiles: float, requestLimit: int, priceMin: int = -1, priceMax: int = -1, propertyTypes: list[PropertyType] = []) -> None:
         self.apiLimit = RateLimiting(
                     delay=(1/20),
                     lastRequest=0,
@@ -32,7 +37,47 @@ class RentCast:
         self.requestLimit = requestLimit
         self.nRequests = 0
         self.completed = False
+        self.priceMin = priceMin
+        self.priceMax = priceMax
+        self.propertyTypes = propertyTypes
         self.listings = [] # Initialize listings bc if it isn't set from a cache, it's accessed later w/o being init
+
+    def removeUnwantedListings(self):
+        checkPropertyTypes = []
+        # YES I KNOW THIS IS NOT IDEAL OKAY I AM IN A RUSH TO GO TO THE POOL
+        if PropertyType.SingleFamily in self.propertyTypes or self.propertyTypes == []:
+            checkPropertyTypes.append("Single Family")
+        if PropertyType.Condo in self.propertyTypes or self.propertyTypes == []:
+            checkPropertyTypes.append("Condo")
+        if PropertyType.Townhouse in self.propertyTypes or self.propertyTypes == []:
+            checkPropertyTypes.append("Townhouse")
+        if PropertyType.Manufactured in self.propertyTypes or self.propertyTypes == []:
+            checkPropertyTypes.append("Manufactured")
+        if PropertyType.MultiFamily in self.propertyTypes or self.propertyTypes == []:
+            checkPropertyTypes.append("Multi-Family")
+        if PropertyType.Apartment in self.propertyTypes or self.propertyTypes == []:
+            checkPropertyTypes.append("Apartment")
+
+        pMin = self.priceMin if self.priceMin != -1 else 0
+        pMax = self.priceMax if self.priceMax != -1 else inf
+
+        for listing in self.listings[:]:
+            propertyType = listing["propertyType"]
+            price = listing["price"]
+            if ((propertyType in checkPropertyTypes) and  # Valid property type
+               price > pMin and price < pMax):          # Valid price range
+                continue
+            self.listings.remove(listing)
+
+    def getPropertyTypeString(self) -> str:
+        if len(self.propertyTypes) == 0:
+            return ""
+        propertyTypeString = f"propertyType={self.propertyTypes[0]}" 
+        if len(self.propertyTypes) == 1:
+            return propertyTypeString
+        for type in self.propertyTypes[1:]:
+            propertyTypeString += f"|{type}"
+        return propertyTypeString
 
     def loadCache(self, cacheFilename) -> bool:
         try:
@@ -116,6 +161,35 @@ class RentCast:
         self.apiLimit.waitIfTooFast()
 
         url = f"https://api.rentcast.io/v1/listings/rental/long-term?latitude={self.latitude}&longitude={self.longitude}&radius={self.radiusMiles}&status=Active&limit=500&includeTotalCount=true&offset={len(self.listings)}"
+
+        # Add preferences to url
+        # PRICE RANGES
+        urlPriceBase = "&price="
+        urlPrice = urlPriceBase
+        if (self.priceMin != -1):
+            urlPrice += str(self.priceMin) + ":"
+        else:
+            urlPrice += "*:"
+        if (self.priceMax != -1):
+            urlPrice += str(self.priceMax)
+        else:
+            urlPrice += "*"
+
+        if (self.priceMin != 1 or self.priceMax != 1):
+            url += urlPrice
+
+        # PROPERTY TYPES
+        urlPropertyTypeBase = "&propertyType="
+        urlPropertyType = urlPropertyTypeBase
+        if len(self.propertyTypes) > 0:
+            urlPropertyType += self.propertyTypes[0]
+        if len(self.propertyTypes) > 1:
+            for propertyType in self.propertyTypes[1:]:
+                urlPropertyType += f"|{propertyType}"
+
+        if (urlPropertyType != urlPropertyTypeBase):
+            url += urlPropertyType
+
         headers = {
             "accept": "application/json", 
             "X-Api-Key": self.apiKey 
@@ -133,5 +207,4 @@ class RentCast:
         # Check if grabbed all, if so, indicated this search is fully completed
         total = int(response.headers.get("X-Total-Count", "0"))
         self.completed = len(self.listings) > total
-
 

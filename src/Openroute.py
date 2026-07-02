@@ -195,7 +195,6 @@ class Openroute:
         body = {
             "locations": locations,
             "metrics": ["distance", "duration"],
-            "units": "mi"
         }
         response = requests.post(
             "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",

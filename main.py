@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+from typing import List
 import requests
 from dotenv import load_dotenv, find_dotenv
 import pandas as pd
@@ -33,7 +34,6 @@ poiCategories = [
     "commercial.supermarket",
     "education.library"
 ]
-poiNames = [name.split('.')[-1] for name in poiCategories]
 
 def main():
     args = setCommandLineArguments()
@@ -218,7 +218,7 @@ def main():
             listingCoord,
             workCoord
         ]
-        for name in poiNames:
+        for name in poiCategories:
             coord = pois.get(name)
             locations.append(coord if coord else listingCoord) # Use listing coord if no POI found -> res = 0
 
@@ -232,7 +232,7 @@ def main():
                     )
             print(f"Work commute: {workSummary}")
             poiSummaries = {}
-            for index, name in enumerate(poiNames):
+            for index, name in enumerate(poiCategories):
                 poiSummaries[name] = OpenrouteSummary(
                             duration=summary.durationMatrix[0][index + 2],
                             distance=summary.distanceMatrix[0][index + 2]
@@ -261,54 +261,59 @@ def main():
         except ValueError as err:
             print(f"ERROR: Unexpected value format from route summary: {err.args}")
             if nCompleted > 0:
-                cacheProcessedAndExit(processed=listingsDict, 
-                                      processedCacheFilename=args.processedCacheFilename,
-                                      rentcastCacheFilename=args.rentcastCacheFilename,
-                                      searchParamsFilename=searchParamsFilename,
-                                      outputExcelFilename=outputExcelFilename,
-                                      completedRentcast=rentcast.completed
-                                      )
-            else:
-                exit(1)
+                cacheProcessed(processed=listingsDict, 
+                               processedCacheFilename=args.processedCacheFilename,
+                               rentcastCacheFilename=args.rentcastCacheFilename,
+                               searchParamsFilename=searchParamsFilename,
+                               outputExcelFilename=outputExcelFilename,
+                               completedRentcast=rentcast.completed
+                               )
+                columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
+                generatePOIColumnNames(columns, poiCategories)
+                saveExcel(listingsDict, columns, outputExcelFilename)
+            exit(1)
         except requests.exceptions.RequestException as err:
             print(f"ERROR: Unhandled error from route summary {err}")
             if nCompleted > 0:
-                cacheProcessedAndExit(processed=listingsDict, 
-                                      processedCacheFilename=args.processedCacheFilename,
-                                      rentcastCacheFilename=args.rentcastCacheFilename,
-                                      searchParamsFilename=searchParamsFilename,
-                                      outputExcelFilename=outputExcelFilename,
-                                      completedRentcast=rentcast.completed
-                                      )
-            else:
-                exit(1)
+                cacheProcessed(processed=listingsDict, 
+                               processedCacheFilename=args.processedCacheFilename,
+                               rentcastCacheFilename=args.rentcastCacheFilename,
+                               searchParamsFilename=searchParamsFilename,
+                               outputExcelFilename=outputExcelFilename,
+                               completedRentcast=rentcast.completed
+                               )
+                columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
+                generatePOIColumnNames(columns, poiCategories)
+                saveExcel(listingsDict, columns, outputExcelFilename)
+            exit(1)
         except QuotaExhaustedError as err:
             print(f"ERROR: Quota {err}")
             if nCompleted > 0:
-                cacheProcessedAndExit(processed=listingsDict, 
-                                      processedCacheFilename=args.processedCacheFilename,
-                                      rentcastCacheFilename=args.rentcastCacheFilename,
-                                      searchParamsFilename=searchParamsFilename,
-                                      outputExcelFilename=outputExcelFilename,
-                                      completedRentcast=rentcast.completed
-                                      )
-            else:
-                exit(1)
+                cacheProcessed(processed=listingsDict, 
+                               processedCacheFilename=args.processedCacheFilename,
+                               rentcastCacheFilename=args.rentcastCacheFilename,
+                               searchParamsFilename=searchParamsFilename,
+                               outputExcelFilename=outputExcelFilename,
+                               completedRentcast=rentcast.completed
+                               )
+                columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
+                generatePOIColumnNames(columns, poiCategories)
+                saveExcel(listingsDict, columns, outputExcelFilename)
+            exit(1)
 
 
+    # Cache in case it fails
+    cacheProcessed(processed=listingsDict, 
+                   processedCacheFilename=args.processedCacheFilename,
+                   rentcastCacheFilename=args.rentcastCacheFilename,
+                   searchParamsFilename=searchParamsFilename,
+                   outputExcelFilename=outputExcelFilename,
+                   completedRentcast=rentcast.completed
+                   )
     # Save as excel spreadsheet
-    df = pd.DataFrame(listingsDict)
     columns=["Address", "Coord", "Price", "Bedrooms", "Bathrooms", "Work Dur(min)", "Work Dist(mi)"]
-    for name in poiNames:
-        durationColumn = f"{name.title()} Dur(min)"
-        distanceColumn = f"{name.title()} Dist(mi)"
-        columns.append(durationColumn)
-        columns.append(distanceColumn)
-
-    df.columns=columns
-
-    df.to_excel(outputExcelFilename, index=False, float_format="%.2f")
-    print(f"Outputting to {outputExcelFilename}")
+    generatePOIColumnNames(columns, poiCategories)
+    saveExcel(listingsDict, columns, outputExcelFilename)
 
 def setCommandLineArguments():
     # Grab command line arguments
@@ -404,7 +409,23 @@ def grabAndSaveSearchParamInput() -> tuple[dict, str]:
 
     return (searchParams, searchParamsFilename)
 
-def cacheProcessedAndExit(processed: list[dict], processedCacheFilename: str, rentcastCacheFilename: str, searchParamsFilename: str, outputExcelFilename: str, completedRentcast: bool):
+def generatePOIColumnNames(colNames: List[str], poiCategories: List[str]):
+    poiNames = [name.split('.')[-1] for name in poiCategories]
+
+    for name in poiNames:
+        durationColumn = f"{name.title()} Dur(min)"
+        distanceColumn = f"{name.title()} Dist(mi)"
+        colNames.append(durationColumn)
+        colNames.append(distanceColumn)
+
+def saveExcel(data: List[dict], colNames: List[str], filename):
+    df = pd.DataFrame(data)
+    df.columns=colNames
+    df.to_excel(filename, index=False, float_format="%.2f")
+
+    print(f"Outputting to {filename}")
+
+def cacheProcessed(processed: list[dict], processedCacheFilename: str, rentcastCacheFilename: str, searchParamsFilename: str, outputExcelFilename: str, completedRentcast: bool):
     if len(processed) == 0:
         print("No processed listings to cache")
         exit(1)
@@ -419,8 +440,6 @@ def cacheProcessedAndExit(processed: list[dict], processedCacheFilename: str, re
         `python3 main.py {"-c " if completedRentcast else ""}-C {rentcastCacheFilename} -S {searchParamsFilename} -P {processedCacheFilename}{" -E " if outputExcelFilename != "" else ""}{outputExcelFilename} [-L <rentcastLimit>]`
     Set rentcastLimit if you're broke and the quota hasn't reset and can't pay for the reqs
     """)
-
-    exit(1)
 
 if __name__ == "__main__":
     main()

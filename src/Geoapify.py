@@ -83,7 +83,7 @@ class Geoapify:
     def findPOIs(self, latitude: float, longitude: float, radiusMiles: float, poiCategories: list[str]) -> dict[str, Coordinate]:
         pois = {}
         for category in poiCategories:
-            name = category.split(".")[-1]
+            name = category
             try:
                 pois[name] = self.grabPOI(
                         latitude=latitude, longitude=longitude,
